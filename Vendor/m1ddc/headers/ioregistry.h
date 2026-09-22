@@ -40,7 +40,7 @@ typedef struct
 CGDisplayCount  getOnlineDisplayInfos(DisplayInfos* displayInfos);
 DisplayInfos*   selectDisplay(DisplayInfos *displays, int connectedDisplays, char *displayIdentifier);
 
-IOAVServiceRef  getDefaultDisplayAVService();
+IOAVServiceRef  getDefaultDisplayAVService(void) CF_RETURNS_RETAINED;
 IOAVServiceRef  getDisplayAVService(DisplayInfos* displayInfos);
 DDCTransport    getDisplayDDCTransport(DisplayInfos* displayInfos);
 

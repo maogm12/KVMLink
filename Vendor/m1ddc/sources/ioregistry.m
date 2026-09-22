@@ -8,7 +8,15 @@
 
 static CFTypeRef getCFStringRef(io_service_t service, char* key) {
     CFStringRef cfstring = CFStringCreateWithCString(kCFAllocatorDefault, key, kCFStringEncodingASCII);
-    return IORegistryEntrySearchCFProperty(service, kIOServicePlane, cfstring, kCFAllocatorDefault, kIORegistryIterateRecursively);
+    CFTypeRef value = IORegistryEntrySearchCFProperty(
+        service,
+        kIOServicePlane,
+        cfstring,
+        kCFAllocatorDefault,
+        kIORegistryIterateRecursively
+    );
+    CFRelease(cfstring);
+    return value;
 }
 
 static Boolean isMCDP29XXProxy(io_service_t proxy) {
@@ -58,31 +66,49 @@ CGDisplayCount getOnlineDisplayInfos(DisplayInfos* displayInfos) {
         currDisplay->model = CGDisplayModelNumber(currDisplay->id);
         currDisplay->vendor = CGDisplayVendorNumber(currDisplay->id);
 
-        currDisplay->uuid = CFDictionaryGetValue(displayInfoDict, CFSTR("kCGDisplayUUID"));
-        currDisplay->ioLocation = CFDictionaryGetValue(displayInfoDict, CFSTR("IODisplayLocation"));
+        CFTypeRef uuid = CFDictionaryGetValue(displayInfoDict, CFSTR("kCGDisplayUUID"));
+        CFTypeRef ioLocation = CFDictionaryGetValue(displayInfoDict, CFSTR("IODisplayLocation"));
 
         // Skip virtual displays (like Sidecar/AirPlay) that don't have required properties
-        if (currDisplay->uuid == NULL || currDisplay->ioLocation == NULL) {
+        if (uuid == NULL || ioLocation == NULL ||
+            CFGetTypeID(uuid) != CFStringGetTypeID() ||
+            CFGetTypeID(ioLocation) != CFStringGetTypeID()) {
+            CFRelease(displayInfoDict);
             continue;
         }
+
+        currDisplay->uuid = (NSString *)CFRetain(uuid);
+        currDisplay->ioLocation = (NSString *)CFRetain(ioLocation);
+        CFRelease(displayInfoDict);
 
         // Retrieving IORegistry entry for display
         currDisplay->adapter = IORegistryEntryCopyFromPath(kIOMainPortDefault, (CFStringRef)currDisplay->ioLocation);
         if (currDisplay->adapter == MACH_PORT_NULL) {
+            CFRelease((CFTypeRef)currDisplay->uuid);
+            CFRelease((CFTypeRef)currDisplay->ioLocation);
+            currDisplay->uuid = nil;
+            currDisplay->ioLocation = nil;
             continue;
         }
 
         // If successful, we can retrieve the EDID UUID, and other display attributes
         currDisplay->edid = getCFStringRef(currDisplay->adapter, "EDID UUID");
-        CFDictionaryRef displayAttrs = getCFStringRef(currDisplay->adapter, "DisplayAttributes");
-        if (displayAttrs) {
+        CFTypeRef displayAttrs = getCFStringRef(currDisplay->adapter, "DisplayAttributes");
+        if (displayAttrs && CFGetTypeID(displayAttrs) == CFDictionaryGetTypeID()) {
             NSDictionary* displayAttrsNS = (NSDictionary*)displayAttrs;
             NSDictionary* productAttrs = [displayAttrsNS objectForKey:@"ProductAttributes"];
             if (productAttrs) {
-                currDisplay->productName = [productAttrs objectForKey:@"ProductName"] ?: @"Unknown Display";
-                currDisplay->manufacturer = [productAttrs objectForKey:@"ManufacturerID"];
-                currDisplay->alphNumSerial = [productAttrs objectForKey:@"AlphanumericSerialNumber"];
+                NSString *productName = [productAttrs objectForKey:@"ProductName"];
+                NSString *manufacturer = [productAttrs objectForKey:@"ManufacturerID"];
+                NSString *alphNumSerial = [productAttrs objectForKey:@"AlphanumericSerialNumber"];
+                if (productName) currDisplay->productName = (NSString *)CFRetain((CFTypeRef)productName);
+                if (manufacturer) currDisplay->manufacturer = (NSString *)CFRetain((CFTypeRef)manufacturer);
+                if (alphNumSerial) currDisplay->alphNumSerial = (NSString *)CFRetain((CFTypeRef)alphNumSerial);
             }
+        }
+        if (displayAttrs) CFRelease(displayAttrs);
+        if (currDisplay->productName == nil) {
+            currDisplay->productName = (NSString *)CFRetain(CFSTR("Unknown Display"));
         }
 
         validDisplayCount++;

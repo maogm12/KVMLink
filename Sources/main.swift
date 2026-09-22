@@ -7,6 +7,8 @@ import ServiceManagement
 @_silgen_name("KVMLinkSetLGInput")
 private func KVMLinkSetLGInput(_ displayUUID: UnsafePointer<CChar>, _ inputValue: UInt16) -> Int32
 
+private let configuredDDCDisplayUUID = "021CDC53-14FF-410A-A562-2C0AD9A4E66A"
+
 // MARK: - Private display bridge
 
 private typealias ConfigureDisplayEnabledFunction = @convention(c) (
@@ -30,6 +32,17 @@ private struct DisplayRecord: Hashable {
     let width: Int
     let height: Int
     let disabledByThisApp: Bool
+
+    var supportsDDCInputSwitch: Bool {
+        uuid.caseInsensitiveCompare(configuredDDCDisplayUUID) == .orderedSame
+    }
+}
+
+private enum LinkOperationState {
+    case idle
+    case active
+    case stopped
+    case failed(String)
 }
 
 private enum DisplayControlError: LocalizedError {
@@ -324,6 +337,9 @@ private final class DDCController {
     private let connectedInput = 145
 
     func switchInput(displayUUID: String, connected: Bool) throws {
+        guard displayUUID.caseInsensitiveCompare(configuredDDCDisplayUUID) == .orderedSame else {
+            throw DDCControlError.commandFailed(-4)
+        }
         let input = UInt16(connected ? connectedInput : awayInput)
         let result = displayUUID.withCString { KVMLinkSetLGInput($0, input) }
         guard result == 0 else {
@@ -508,6 +524,7 @@ private struct LinkUISnapshot {
     let automationEnabled: Bool
     let controlMode: DisplayControlMode
     let language: AppLanguage
+    let operationState: LinkOperationState
     let loginEnabled: Bool
     let status: String
 }
@@ -604,15 +621,20 @@ private final class LinkConnectorView: NSView {
         linked = snapshot.automationEnabled
         super.init(frame: .zero)
 
-        let liveKeys = Set(snapshot.devices.map(\.key))
-        let devicePresent = !snapshot.selectedUSBKeys.intersection(liveKeys).isEmpty
         let statusText: String
         if !snapshot.automationEnabled {
             statusText = snapshot.language.text("已停止联动", "Linking stopped")
-        } else if devicePresent {
-            statusText = snapshot.language.text("设备已连接，屏幕输出中", "Device connected, display active")
         } else {
-            statusText = snapshot.language.text("设备已断开，屏幕已切断", "Device disconnected, display stopped")
+            switch snapshot.operationState {
+            case .idle:
+                statusText = snapshot.language.text("正在同步…", "Syncing…")
+            case .active:
+                statusText = snapshot.language.text("设备已连接，屏幕输出中", "Device connected, display active")
+            case .stopped:
+                statusText = snapshot.language.text("设备已断开，屏幕已切断", "Device disconnected, display stopped")
+            case .failed:
+                statusText = snapshot.language.text("操作失败", "Operation failed")
+            }
         }
 
         let linkButton = CircularLinkButton()
@@ -635,8 +657,16 @@ private final class LinkConnectorView: NSView {
 
         let status = NSTextField(labelWithString: statusText)
         status.font = .systemFont(ofSize: 11.5, weight: .medium)
-        status.textColor = linked ? .secondaryLabelColor : .tertiaryLabelColor
+        if case .failed = snapshot.operationState, linked {
+            status.textColor = .systemRed
+        } else {
+            status.textColor = linked ? .secondaryLabelColor : .tertiaryLabelColor
+        }
         status.alignment = .center
+        if case .failed(let message) = snapshot.operationState {
+            status.toolTip = message
+            linkButton.toolTip = message
+        }
 
         let stack = NSStackView(views: [linkButton, status])
         stack.orientation = .vertical
@@ -840,8 +870,6 @@ private final class LinkPopoverViewController: NSViewController {
             trailing: pill
         ), to: stack)
 
-        let liveKeys = Set(snapshot.devices.map(\.key))
-        let devicePresent = !snapshot.selectedUSBKeys.intersection(liveKeys).isEmpty
         if snapshot.displays.isEmpty {
             stack.addArrangedSubview(makeEmptyLabel(snapshot.language.text(
                 "没有检测到外接显示器",
@@ -852,7 +880,24 @@ private final class LinkPopoverViewController: NSViewController {
             let selected = snapshot.selectedDisplayUUID?.caseInsensitiveCompare(display.uuid) == .orderedSame
             let stateText: String
             let stateColor: NSColor
-            if display.disabledByThisApp || (selected && snapshot.automationEnabled && !devicePresent) {
+            if selected, snapshot.automationEnabled {
+                switch snapshot.operationState {
+                case .failed:
+                    stateText = snapshot.language.text("错误", "Error")
+                    stateColor = .systemRed
+                case .stopped:
+                    stateText = snapshot.language.text("已切断", "Stopped")
+                    stateColor = .systemRed
+                case .active:
+                    stateText = snapshot.language.text("输出中", "Active")
+                    stateColor = .controlAccentColor
+                case .idle:
+                    stateText = display.isOnline
+                        ? snapshot.language.text("输出中", "Active")
+                        : snapshot.language.text("未连接", "Disconnected")
+                    stateColor = display.isOnline ? .controlAccentColor : .tertiaryLabelColor
+                }
+            } else if display.disabledByThisApp {
                 stateText = snapshot.language.text("已切断", "Stopped")
                 stateColor = .systemRed
             } else if display.isOnline {
@@ -951,6 +996,17 @@ private final class LinkPopoverViewController: NSViewController {
             action: #selector(controlModePressed(_:))
         )
         control.selectedSegment = snapshot.controlMode == .stopOutput ? 0 : 1
+        let selectedDisplay = snapshot.displays.first {
+            snapshot.selectedDisplayUUID?.caseInsensitiveCompare($0.uuid) == .orderedSame
+        }
+        let ddcSupported = selectedDisplay?.supportsDDCInputSwitch == true
+        control.setEnabled(ddcSupported, forSegment: 1)
+        if !ddcSupported {
+            control.toolTip = snapshot.language.text(
+                "DDC 输入切换仅为已配置的 LG 屏幕启用",
+                "DDC input switching is enabled only for the configured LG display"
+            )
+        }
         control.controlSize = .small
         control.setWidth(snapshot.language == .chinese ? 92 : 102, forSegment: 0)
         control.setWidth(snapshot.language == .chinese ? 118 : 126, forSegment: 1)
@@ -1132,9 +1188,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var lastObservedPresentCount: Int?
     private var isChangingDisplay = false
     private var lastStatus = "正在启动…"
+    private var lastOperationState: LinkOperationState = .idle
     private var recentEvents: [String] = []
     private var suppressAutomationUntil = Date.distantPast
     private var resignActiveObserver: NSObjectProtocol?
+    private let isRenderingUI = CommandLine.arguments.contains("--render-ui")
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -1147,8 +1205,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         statusItem.button?.target = self
         statusItem.button?.action = #selector(togglePopover(_:))
 
-        performInitialSetupIfNeeded()
-        normalizeSingleDeviceSelection()
+        if !isRenderingUI {
+            performInitialSetupIfNeeded()
+            normalizeSingleDeviceSelection()
+            normalizeControlModeForSelectedDisplay()
+        }
         configurePopover()
         resignActiveObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didResignActiveNotification,
@@ -1162,13 +1223,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         rebuildMenu()
         record("应用已启动")
 
-        timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            self?.poll()
-        }
-        RunLoop.main.add(timer!, forMode: .common)
+        if !isRenderingUI {
+            timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+                self?.poll()
+            }
+            RunLoop.main.add(timer!, forMode: .common)
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-            self?.poll(force: true)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                self?.poll(force: true)
+            }
         }
 
         if CommandLine.arguments.contains("--preview-ui") {
@@ -1197,6 +1260,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         if let resignActiveObserver {
             NotificationCenter.default.removeObserver(resignActiveObserver)
         }
+        guard !isRenderingUI else { return }
         if let uuid = configuration.displayUUID {
             if configuration.controlMode == .stopOutput {
                 try? displayController.setEnabled(uuid: uuid, enabled: true)
@@ -1219,6 +1283,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                     selectedDisplayUUID: nil, automationEnabled: false,
                     controlMode: .stopOutput,
                     language: .chinese,
+                    operationState: .idle,
                     loginEnabled: false, status: "应用正在关闭"
                 )
             }
@@ -1237,6 +1302,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                 automationEnabled: self.configuration.automationEnabled,
                 controlMode: self.configuration.controlMode,
                 language: self.configuration.interfaceLanguage,
+                operationState: self.lastOperationState,
                 loginEnabled: loginEnabled,
                 status: self.lastStatus
             )
@@ -1328,11 +1394,29 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
     }
 
+    private func normalizeControlModeForSelectedDisplay() {
+        guard configuration.controlMode == .ddcInputSwitch else { return }
+        guard let uuid = configuration.displayUUID,
+              uuid.caseInsensitiveCompare(configuredDDCDisplayUUID) == .orderedSame else {
+            configuration.controlMode = .stopOutput
+            record("未配置 DDC 的屏幕已回退到停止输出模式")
+            return
+        }
+    }
+
     private func poll(force: Bool = false) {
-        guard configuration.automationEnabled,
-              configuration.displayUUID != nil,
-              !configuration.selectedUSBKeys.isEmpty,
-              Date() >= suppressAutomationUntil else {
+        guard configuration.automationEnabled else {
+            lastOperationState = .idle
+            updateStatus()
+            return
+        }
+        guard configuration.displayUUID != nil,
+              !configuration.selectedUSBKeys.isEmpty else {
+            lastOperationState = .idle
+            updateStatus()
+            return
+        }
+        guard Date() >= suppressAutomationUntil else {
             updateStatus()
             return
         }
@@ -1410,10 +1494,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                 try displayController.setEnabled(uuid: uuid, enabled: true)
             }
             try ddcController.switchInput(displayUUID: uuid, connected: connected)
+            lastOperationState = connected ? .active : .stopped
             lastStatus = connected ? "设备已连接，屏幕输出中" : "设备已断开，屏幕已切断"
             record("\(reason)：DDC 切换至 \(connected ? "HDMI 2" : "HDMI 1")")
             updateIcon(state: connected ? .linked : .away)
         } catch {
+            lastOperationState = .failed(error.localizedDescription)
             lastStatus = error.localizedDescription
             record("DDC 操作失败：\(error.localizedDescription)")
             updateIcon(state: .error)
@@ -1434,20 +1520,24 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             guard let display = displayController.display(uuid: uuid) else {
                 // The exact selected monitor is not attached. Do nothing to every other monitor.
                 lastStatus = "绑定的显示器不在这台 Mac 上"
+                lastOperationState = .failed(lastStatus)
                 updateIcon(state: .paused)
                 return
             }
             if display.isOnline == enabled {
+                lastOperationState = enabled ? .active : .stopped
                 lastStatus = enabled ? "USB 已接入，屏幕输出已开启" : "USB 已离开，屏幕输出已断开"
                 updateIcon(state: enabled ? .linked : .away)
                 return
             }
 
             try displayController.setEnabled(uuid: uuid, enabled: enabled)
+            lastOperationState = enabled ? .active : .stopped
             lastStatus = enabled ? "USB 已接入，已恢复 \(display.name)" : "USB 已离开，已断开 \(display.name)"
             record("\(reason)：\(enabled ? "恢复" : "断开") \(display.name)")
             updateIcon(state: enabled ? .linked : .away)
         } catch {
+            lastOperationState = .failed(error.localizedDescription)
             lastStatus = error.localizedDescription
             record("操作失败：\(error.localizedDescription)")
             updateIcon(state: .error)
@@ -1657,6 +1747,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     @objc private func toggleAutomation(_ sender: NSMenuItem) {
         configuration.automationEnabled.toggle()
+        lastOperationState = .idle
         record(configuration.automationEnabled ? "自动联动已开启" : "自动联动已暂停")
         if configuration.automationEnabled {
             poll(force: true)
@@ -1677,6 +1768,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         configuration.selectedUSBKeys = [key]
         configuration.usbLabels = labels
         lastObservedUSBPresent = nil
+        lastOperationState = .idle
         record("监控设备已切换")
         poll(force: true)
         rebuildMenu()
@@ -1689,11 +1781,19 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
         if let oldUUID = configuration.displayUUID,
            oldUUID.uppercased() != uuid.uppercased() {
-            try? displayController.setEnabled(uuid: oldUUID, enabled: true)
+            if configuration.controlMode == .ddcInputSwitch {
+                try? ddcController.switchInput(displayUUID: oldUUID, connected: true)
+            } else {
+                try? displayController.setEnabled(uuid: oldUUID, enabled: true)
+            }
         }
         configuration.displayUUID = uuid
         configuration.displayName = display.name
+        if configuration.controlMode == .ddcInputSwitch, !display.supportsDDCInputSwitch {
+            configuration.controlMode = .stopOutput
+        }
         lastObservedUSBPresent = nil
+        lastOperationState = .idle
         record("已绑定显示器：\(display.name)")
         poll(force: true)
         rebuildMenu()
@@ -1701,12 +1801,25 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     private func selectControlMode(_ mode: DisplayControlMode) {
         guard configuration.controlMode != mode else { return }
+        if mode == .ddcInputSwitch {
+            guard let uuid = configuration.displayUUID,
+                  uuid.caseInsensitiveCompare(configuredDDCDisplayUUID) == .orderedSame else {
+                let message = configuration.interfaceLanguage.text(
+                    "所选屏幕没有配置 DDC 输入切换",
+                    "DDC input switching is not configured for the selected display"
+                )
+                lastOperationState = .failed(message)
+                popoverController?.refresh()
+                return
+            }
+        }
         pendingSync?.cancel()
         if let uuid = configuration.displayUUID {
             try? displayController.setEnabled(uuid: uuid, enabled: true)
         }
         configuration.controlMode = mode
         lastObservedUSBPresent = nil
+        lastOperationState = .idle
         record(mode == .stopOutput ? "控制方式：停止输出" : "控制方式：DDC 输入切换")
         poll(force: true)
         rebuildMenu()
@@ -1763,13 +1876,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     @objc private func quit(_ sender: NSMenuItem) {
-        if let uuid = configuration.displayUUID {
-            if configuration.controlMode == .stopOutput {
-                try? displayController.setEnabled(uuid: uuid, enabled: true)
-            } else {
-                try? ddcController.switchInput(displayUUID: uuid, connected: true)
-            }
-        }
         NSApp.terminate(nil)
     }
 

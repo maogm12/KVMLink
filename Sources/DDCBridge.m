@@ -5,6 +5,18 @@
 #include "i2c.h"
 #include "ioregistry.h"
 
+static void releaseDisplayInfos(DisplayInfos *displays, CGDisplayCount displayCount) {
+    for (CGDisplayCount index = 0; index < displayCount; ++index) {
+        if (displays[index].adapter != MACH_PORT_NULL) IOObjectRelease(displays[index].adapter);
+        if (displays[index].uuid != nil) CFRelease((CFTypeRef)displays[index].uuid);
+        if (displays[index].ioLocation != nil) CFRelease((CFTypeRef)displays[index].ioLocation);
+        if (displays[index].edid != nil) CFRelease((CFTypeRef)displays[index].edid);
+        if (displays[index].productName != nil) CFRelease((CFTypeRef)displays[index].productName);
+        if (displays[index].manufacturer != nil) CFRelease((CFTypeRef)displays[index].manufacturer);
+        if (displays[index].alphNumSerial != nil) CFRelease((CFTypeRef)displays[index].alphNumSerial);
+    }
+}
+
 int32_t KVMLinkSetLGInput(const char *displayUUID, uint16_t inputValue) {
     @autoreleasepool {
         if (displayUUID == NULL) {
@@ -24,21 +36,13 @@ int32_t KVMLinkSetLGInput(const char *displayUUID, uint16_t inputValue) {
         }
 
         if (target == NULL) {
-            for (CGDisplayCount index = 0; index < displayCount; ++index) {
-                if (displays[index].adapter != MACH_PORT_NULL) {
-                    IOObjectRelease(displays[index].adapter);
-                }
-            }
+            releaseDisplayInfos(displays, displayCount);
             return -2;
         }
 
         DDCTransport transport = getDisplayDDCTransport(target);
         if (transport.service == NULL) {
-            for (CGDisplayCount index = 0; index < displayCount; ++index) {
-                if (displays[index].adapter != MACH_PORT_NULL) {
-                    IOObjectRelease(displays[index].adapter);
-                }
-            }
+            releaseDisplayInfos(displays, displayCount);
             return -3;
         }
 
@@ -51,11 +55,7 @@ int32_t KVMLinkSetLGInput(const char *displayUUID, uint16_t inputValue) {
         );
 
         CFRelease(transport.service);
-        for (CGDisplayCount index = 0; index < displayCount; ++index) {
-            if (displays[index].adapter != MACH_PORT_NULL) {
-                IOObjectRelease(displays[index].adapter);
-            }
-        }
+        releaseDisplayInfos(displays, displayCount);
         return result == kIOReturnSuccess ? 0 : (int32_t)result;
     }
 }
